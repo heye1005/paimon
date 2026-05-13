@@ -65,6 +65,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.apache.paimon.catalog.Identifier.SYSTEM_TABLE_SPLITTER;
@@ -191,13 +192,15 @@ public class BranchesTable implements ReadonlyTable {
         private final FileIO fileIO;
         private RowType readType;
 
+        @Nullable private Predicate postFilter;
+
         public BranchesRead(FileIO fileIO) {
             this.fileIO = fileIO;
         }
 
         @Override
         public InnerTableRead withFilter(Predicate predicate) {
-            // TODO
+            this.postFilter = predicate;
             return this;
         }
 
@@ -226,6 +229,10 @@ public class BranchesTable implements ReadonlyTable {
                 rows = branches(table, predicate).iterator();
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
+            }
+
+            if (postFilter != null) {
+                rows = Iterators.filter(rows, postFilter::test);
             }
 
             if (readType != null) {
@@ -261,7 +268,11 @@ public class BranchesTable implements ReadonlyTable {
             BranchManager branchManager = table.branchManager();
             Path tablePath = table.location();
             List<InternalRow> result = new ArrayList<>();
-            // Handle predicate filtering for branch_name
+            // Handle predicate filtering for branch_name. Only the EQUAL and OR-IN forms can
+            // be answered directly by checking branchExists; all other predicate shapes fall
+            // through to listing every branch and rely on the read-side post-filter for
+            // further refinement.
+            boolean handled = false;
             if (predicate != null) {
                 // Handle Equal predicate
                 if (predicate instanceof LeafPredicate
@@ -273,28 +284,30 @@ public class BranchesTable implements ReadonlyTable {
                     if (branchManager.branchExists(equalValue)) {
                         result.add(createBranchRow(equalValue, tablePath));
                     }
+                    handled = true;
                 }
 
                 // Handle CompoundPredicate (OR case for IN filter)
-                if (predicate instanceof CompoundPredicate) {
+                if (!handled && predicate instanceof CompoundPredicate) {
                     CompoundPredicate compoundPredicate = (CompoundPredicate) predicate;
                     if ((compoundPredicate.function()) instanceof Or) {
-                        List<String> branchNames = new ArrayList<>();
-                        InPredicateVisitor.extractInElements(predicate, BRANCH_NAME)
-                                .ifPresent(
-                                        e ->
-                                                e.stream()
-                                                        .map(Object::toString)
-                                                        .forEach(branchNames::add));
-                        for (String branchName : branchNames) {
-                            if (branchManager.branchExists(branchName)) {
-                                result.add(createBranchRow(branchName, tablePath));
+                        Optional<List<Object>> inElements =
+                                InPredicateVisitor.extractInElements(predicate, BRANCH_NAME);
+                        if (inElements.isPresent()) {
+                            for (Object element : inElements.get()) {
+                                String branchName = element.toString();
+                                if (branchManager.branchExists(branchName)) {
+                                    result.add(createBranchRow(branchName, tablePath));
+                                }
                             }
+                            handled = true;
                         }
                     }
                 }
-            } else {
-                // Fallback to original logic if no predicate
+            }
+            if (!handled) {
+                // Fallback to listing all branches; any leftover predicate (e.g. <>, LIKE,
+                // filters on create_time, etc.) is evaluated by the read-side post-filter.
                 List<String> branches = branchManager.branches();
                 for (String branch : branches) {
                     result.add(createBranchRow(branch, tablePath));

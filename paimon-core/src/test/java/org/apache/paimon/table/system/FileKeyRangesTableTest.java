@@ -183,6 +183,48 @@ public class FileKeyRangesTableTest extends TableTestBase {
         assertThat(hasPt2).isTrue();
     }
 
+    @Test
+    public void testReadWithRecordCountPostFilter() throws Exception {
+        // record_count (index 6) is not pushed down by scan; only the read-side post-filter
+        // can apply this predicate.
+        PredicateBuilder builder = new PredicateBuilder(FileKeyRangesTable.TABLE_TYPE);
+        // every test row has exactly 1 record (each write produces one row per file)
+        assertThat(readPartBucketLevel(builder.greaterOrEqual(6, 1L))).isNotEmpty();
+        assertThat(readPartBucketLevel(builder.greaterThan(6, 100L))).isEmpty();
+    }
+
+    @Test
+    public void testReadWithSchemaIdPostFilter() throws Exception {
+        // schema_id (index 4) is not pushed down by scan; verify the post-filter applies.
+        PredicateBuilder builder = new PredicateBuilder(FileKeyRangesTable.TABLE_TYPE);
+        List<String> baseline = readPartBucketLevel(null);
+        assertThat(baseline).isNotEmpty();
+        assertThat(readPartBucketLevel(builder.equal(4, 0L))).isEqualTo(baseline);
+        assertThat(readPartBucketLevel(builder.equal(4, 9999L))).isEmpty();
+    }
+
+    @Test
+    public void testReadWithCombinedScanAndPostFilter() throws Exception {
+        // Combine a scan-pushdown predicate (partition) with a post-filter only one
+        // (record_count). The result should respect both.
+        PredicateBuilder builder = new PredicateBuilder(FileKeyRangesTable.TABLE_TYPE);
+        Predicate combined =
+                PredicateBuilder.and(
+                        builder.equal(0, BinaryString.fromString("{1}")),
+                        builder.greaterOrEqual(6, 1L));
+        List<String> rows = readPartBucketLevel(combined);
+        assertThat(rows).isNotEmpty();
+        for (String row : rows) {
+            assertThat(row).startsWith("{1}-");
+        }
+        // record_count > 100 prunes everything even though partition predicate matches
+        Predicate combinedEmpty =
+                PredicateBuilder.and(
+                        builder.equal(0, BinaryString.fromString("{1}")),
+                        builder.greaterThan(6, 100L));
+        assertThat(readPartBucketLevel(combinedEmpty)).isEmpty();
+    }
+
     private List<String> readPartBucketLevel(Predicate predicate) throws IOException {
         ReadBuilder rb = fileKeyRangesTable.newReadBuilder();
         if (predicate != null) {
