@@ -159,7 +159,7 @@ public class CdcActionITCaseBase extends ActionITCaseBase {
                 }
             }
             table = table.copyWithLatestSchema();
-            Thread.sleep(1000);
+            Thread.sleep(200);
         }
 
         // wait for data to become expected
@@ -181,7 +181,7 @@ public class CdcActionITCaseBase extends ActionITCaseBase {
             }
             LOG.info("actual: " + sortedActual);
             LOG.info("expected: " + sortedExpected);
-            Thread.sleep(1000);
+            Thread.sleep(200);
         }
     }
 
@@ -261,7 +261,7 @@ public class CdcActionITCaseBase extends ActionITCaseBase {
             if (status == JobStatus.RUNNING) {
                 break;
             }
-            Thread.sleep(1000);
+            Thread.sleep(200);
         }
     }
 

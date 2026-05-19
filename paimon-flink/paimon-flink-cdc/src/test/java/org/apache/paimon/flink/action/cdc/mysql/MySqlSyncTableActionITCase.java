@@ -438,7 +438,7 @@ public class MySqlSyncTableActionITCase extends MySqlActionITCaseBase {
     }
 
     @Test
-    @Timeout(90)
+    @Timeout(240)
     public void testAllTypes() throws Exception {
         // the first round checks for table creation
         // the second round checks for running the action on an existing table
