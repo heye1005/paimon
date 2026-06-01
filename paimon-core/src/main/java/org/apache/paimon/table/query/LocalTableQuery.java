@@ -52,18 +52,29 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
 import static org.apache.paimon.lookup.LookupStoreFactory.bfGenerator;
 import static org.apache.paimon.mergetree.LookupFile.localFilePrefix;
 
-/** Implementation for {@link TableQuery} for caching data and file in local. */
+/**
+ * Implementation for {@link TableQuery} for caching data and file in local.
+ *
+ * <p>Thread-safety: {@link #lookup} may be called from many threads concurrently (e.g. by {@code
+ * KvQueryServer} worker threads), while {@link #refreshFiles} is typically called from a single
+ * task thread. Concurrency is handled at bucket granularity: lookups against different (partition,
+ * bucket) pairs run in parallel; per-bucket access (lookup vs refresh, and lookup vs lookup) is
+ * serialized on the {@link LookupLevels} instance, because {@link LookupLevels} mutates internal
+ * state (file cache bookkeeping, level updates) that is not thread-safe.
+ */
 public class LocalTableQuery implements TableQuery {
 
-    private final Map<BinaryRow, Map<Integer, LookupLevels<KeyValue>>> tableView;
+    private final ConcurrentMap<BinaryRow, ConcurrentMap<Integer, LookupLevels<KeyValue>>>
+            tableView;
 
     private final CoreOptions options;
 
@@ -71,7 +82,10 @@ public class LocalTableQuery implements TableQuery {
 
     private final KeyValueFileReaderFactory.Builder readerFactoryBuilder;
 
-    private final LookupStoreFactory lookupStoreFactory;
+    // Shared across all buckets: CacheManager owns the memory budget. The
+    // LookupStoreFactory itself (which wraps a stateful SliceComparator) is built fresh per
+    // bucket inside newLookupLevels, mirroring MergeTreeCompactManagerFactory#createLookupLevels.
+    private final CacheManager cacheManager;
 
     private final int startLevel;
 
@@ -86,7 +100,7 @@ public class LocalTableQuery implements TableQuery {
 
     public LocalTableQuery(FileStoreTable table) {
         this.options = table.coreOptions();
-        this.tableView = new HashMap<>();
+        this.tableView = new ConcurrentHashMap<>();
         FileStore<?> tableStore = table.store();
         if (!(tableStore instanceof KeyValueFileStore)) {
             throw new UnsupportedOperationException(
@@ -97,15 +111,10 @@ public class LocalTableQuery implements TableQuery {
         this.readerFactoryBuilder = store.newReaderFactoryBuilder();
         this.rowType = table.schema().logicalRowType();
         this.partitionType = table.schema().logicalPartitionType();
-        RowType keyType = readerFactoryBuilder.keyType();
         this.keyComparatorSupplier = new KeyComparatorSupplier(readerFactoryBuilder.keyType());
-        this.lookupStoreFactory =
-                LookupStoreFactory.create(
-                        options,
-                        new CacheManager(
-                                options.lookupCacheMaxMemory(),
-                                options.lookupCacheHighPrioPoolRatio()),
-                        new RowCompactedSerializer(keyType).createSliceComparator());
+        this.cacheManager =
+                new CacheManager(
+                        options.lookupCacheMaxMemory(), options.lookupCacheHighPrioPoolRatio());
         startLevel = options.needLookup() ? 1 : 0;
     }
 
@@ -114,67 +123,83 @@ public class LocalTableQuery implements TableQuery {
             int bucket,
             List<DataFileMeta> beforeFiles,
             List<DataFileMeta> dataFiles) {
-        LookupLevels<KeyValue> lookupLevels =
-                tableView.computeIfAbsent(partition, k -> new HashMap<>()).get(bucket);
+        ConcurrentMap<Integer, LookupLevels<KeyValue>> buckets =
+                tableView.computeIfAbsent(partition, k -> new ConcurrentHashMap<>());
+        LookupLevels<KeyValue> lookupLevels = buckets.get(bucket);
         if (lookupLevels == null) {
-            // Initial phase: ignore beforeFiles as they represent deletions from previous state
-            newLookupLevels(partition, bucket, dataFiles);
+            // Initial phase: ignore beforeFiles as they represent deletions from previous state.
+            // computeIfAbsent guarantees we build LookupLevels at most once per (partition,
+            // bucket), even if two refreshers race here.
+            buckets.computeIfAbsent(bucket, b -> newLookupLevels(partition, b, dataFiles));
         } else {
-            lookupLevels.getLevels().update(beforeFiles, dataFiles);
+            // Lock the per-bucket LookupLevels: Levels.update mutates level0/levels in place and
+            // would corrupt concurrent lookups on the same bucket.
+            synchronized (lookupLevels) {
+                lookupLevels.getLevels().update(beforeFiles, dataFiles);
+            }
         }
     }
 
-    private void newLookupLevels(BinaryRow partition, int bucket, List<DataFileMeta> dataFiles) {
+    private LookupLevels<KeyValue> newLookupLevels(
+            BinaryRow partition, int bucket, List<DataFileMeta> dataFiles) {
         Levels levels = new Levels(keyComparatorSupplier.get(), dataFiles, options.numLevels());
         // TODO pass DeletionVector factory
         KeyValueFileReaderFactory factory =
                 readerFactoryBuilder.build(partition, bucket, DeletionVector.emptyFactory());
         Options options = this.options.toConfiguration();
-        if (lookupFileCache == null) {
-            lookupFileCache =
-                    LookupFile.createCache(
-                            options.get(CoreOptions.LOOKUP_CACHE_FILE_RETENTION),
-                            options.get(CoreOptions.LOOKUP_CACHE_MAX_DISK_SIZE));
-        }
+        Cache<String, LookupFile> fileCache = getOrCreateLookupFileCache();
+        RowType keyType = readerFactoryBuilder.keyType();
+        // Per-bucket LookupStoreFactory: the underlying SliceComparator keeps reusable
+        // RowReader state and is NOT thread-safe, so sharing one factory (and hence one
+        // comparator) across buckets would let concurrent lookups on different buckets
+        // corrupt each other's reads.
+        LookupStoreFactory lookupStoreFactory =
+                LookupStoreFactory.create(
+                        this.options,
+                        cacheManager,
+                        new RowCompactedSerializer(keyType).createSliceComparator());
 
         RowType readValueType = readerFactoryBuilder.readValueType();
-        LookupLevels<KeyValue> lookupLevels =
-                new LookupLevels<>(
-                        schemaId -> readValueType,
-                        0L,
-                        levels,
-                        keyComparatorSupplier.get(),
-                        readerFactoryBuilder.keyType(),
-                        PersistValueProcessor.factory(readValueType),
-                        LookupSerializerFactory.INSTANCE.get(),
-                        file -> {
-                            RecordReader<KeyValue> reader = factory.createRecordReader(file);
-                            if (cacheRowFilter != null) {
-                                reader =
-                                        reader.filter(
-                                                keyValue -> cacheRowFilter.test(keyValue.value()));
-                            }
-                            return reader;
-                        },
-                        file ->
-                                Preconditions.checkNotNull(ioManager, "IOManager is required.")
-                                        .createChannel(
-                                                localFilePrefix(
-                                                        partitionType, partition, bucket, file))
-                                        .getPathFile(),
-                        lookupStoreFactory,
-                        bfGenerator(options),
-                        lookupFileCache);
-
-        tableView.computeIfAbsent(partition, k -> new HashMap<>()).put(bucket, lookupLevels);
+        return new LookupLevels<>(
+                schemaId -> readValueType,
+                0L,
+                levels,
+                keyComparatorSupplier.get(),
+                keyType,
+                PersistValueProcessor.factory(readValueType),
+                LookupSerializerFactory.INSTANCE.get(),
+                file -> {
+                    RecordReader<KeyValue> reader = factory.createRecordReader(file);
+                    if (cacheRowFilter != null) {
+                        reader = reader.filter(keyValue -> cacheRowFilter.test(keyValue.value()));
+                    }
+                    return reader;
+                },
+                file ->
+                        Preconditions.checkNotNull(ioManager, "IOManager is required.")
+                                .createChannel(
+                                        localFilePrefix(partitionType, partition, bucket, file))
+                                .getPathFile(),
+                lookupStoreFactory,
+                bfGenerator(options),
+                fileCache);
     }
 
-    /** TODO remove synchronized and supports multiple thread to lookup. */
+    private synchronized Cache<String, LookupFile> getOrCreateLookupFileCache() {
+        if (lookupFileCache == null) {
+            Options conf = this.options.toConfiguration();
+            lookupFileCache =
+                    LookupFile.createCache(
+                            conf.get(CoreOptions.LOOKUP_CACHE_FILE_RETENTION),
+                            conf.get(CoreOptions.LOOKUP_CACHE_MAX_DISK_SIZE));
+        }
+        return lookupFileCache;
+    }
+
     @Nullable
     @Override
-    public synchronized InternalRow lookup(BinaryRow partition, int bucket, InternalRow key)
-            throws IOException {
-        Map<Integer, LookupLevels<KeyValue>> buckets = tableView.get(partition);
+    public InternalRow lookup(BinaryRow partition, int bucket, InternalRow key) throws IOException {
+        ConcurrentMap<Integer, LookupLevels<KeyValue>> buckets = tableView.get(partition);
         if (buckets == null || buckets.isEmpty()) {
             return null;
         }
@@ -183,7 +208,13 @@ public class LocalTableQuery implements TableQuery {
             return null;
         }
 
-        KeyValue kv = lookupLevels.lookup(key, startLevel);
+        // Lock the per-bucket LookupLevels only. Lookups against different buckets (and different
+        // partitions) run in parallel; lookups against the same bucket serialize because
+        // LookupLevels mutates its own file-cache bookkeeping during a miss.
+        KeyValue kv;
+        synchronized (lookupLevels) {
+            kv = lookupLevels.lookup(key, startLevel);
+        }
         if (kv == null || kv.valueKind().isRetract()) {
             return null;
         } else {
@@ -214,11 +245,15 @@ public class LocalTableQuery implements TableQuery {
 
     @Override
     public void close() throws IOException {
-        for (Map.Entry<BinaryRow, Map<Integer, LookupLevels<KeyValue>>> buckets :
+        for (Map.Entry<BinaryRow, ConcurrentMap<Integer, LookupLevels<KeyValue>>> buckets :
                 tableView.entrySet()) {
             for (Map.Entry<Integer, LookupLevels<KeyValue>> bucket :
                     buckets.getValue().entrySet()) {
-                bucket.getValue().close();
+                // Drain in-flight lookups on this bucket before tearing it down.
+                LookupLevels<KeyValue> lookupLevels = bucket.getValue();
+                synchronized (lookupLevels) {
+                    lookupLevels.close();
+                }
             }
         }
         if (lookupFileCache != null) {

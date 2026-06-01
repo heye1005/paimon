@@ -101,9 +101,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -2318,6 +2324,115 @@ public class PrimaryKeySimpleTableTest extends SimpleTableTestBase {
     public void testTableQueryForNormal() throws Exception {
         FileStoreTable table = createFileStoreTable();
         innerTestTableQuery(table);
+    }
+
+    @Test
+    public void testTableQueryConcurrentLookupAndRefresh() throws Exception {
+        // Exercise LocalTableQuery under concurrent load: many reader threads doing parallel
+        // lookups while a refresher thread keeps pushing updates. Cross-partition lookups must
+        // run in parallel; same-bucket lookup-vs-refresh must not corrupt LookupLevels state.
+        FileStoreTable table = createFileStoreTable();
+        IOManager ioManager = IOManager.create(tablePath.toString());
+        StreamTableWrite write = table.newWrite(commitUser).withIOManager(ioManager);
+        StreamTableCommit commit = table.newCommit(commitUser);
+
+        int numPartitions = 5;
+        int numKeysPerPartition = 10;
+        // initial snapshot: every (pt, key) gets value pt*100 + key
+        for (int p = 1; p <= numPartitions; p++) {
+            for (int k = 0; k < numKeysPerPartition; k++) {
+                write.write(rowData(p, k, p * 100L + k));
+            }
+        }
+        List<CommitMessage> initial = write.prepareCommit(true, 0);
+        commit.commit(0, initial);
+
+        LocalTableQuery query = table.newLocalTableQuery().withIOManager(ioManager);
+        refreshTableService(query, initial);
+
+        int numReaders = 8;
+        int lookupsPerReader = 1000;
+        AtomicInteger errors = new AtomicInteger();
+        AtomicReference<Throwable> firstError = new AtomicReference<>();
+        AtomicInteger lookupsHit = new AtomicInteger();
+        AtomicBoolean refresherRunning = new AtomicBoolean(true);
+        AtomicInteger version = new AtomicInteger(0);
+        ExecutorService pool = Executors.newFixedThreadPool(numReaders + 1);
+        List<Future<?>> futures = new ArrayList<>();
+
+        // Refresher: keep pushing updates for random (pt, key). Value monotonically grows.
+        Future<?> refresherFuture =
+                pool.submit(
+                        () -> {
+                            try {
+                                Random rng = new Random(0xC0FFEE);
+                                while (refresherRunning.get()) {
+                                    int v = version.incrementAndGet();
+                                    int p = 1 + rng.nextInt(numPartitions);
+                                    int k = rng.nextInt(numKeysPerPartition);
+                                    write.write(rowData(p, k, p * 100L + k + v));
+                                    List<CommitMessage> msgs = write.prepareCommit(true, v);
+                                    commit.commit(v, msgs);
+                                    refreshTableService(query, msgs);
+                                }
+                            } catch (Throwable t) {
+                                firstError.compareAndSet(null, t);
+                                errors.incrementAndGet();
+                            }
+                        });
+
+        // Readers: hammer lookups across all partitions/keys.
+        for (int i = 0; i < numReaders; i++) {
+            final int seed = i;
+            futures.add(
+                    pool.submit(
+                            () -> {
+                                try {
+                                    Random rng = new Random(seed);
+                                    for (int n = 0; n < lookupsPerReader; n++) {
+                                        int p = 1 + rng.nextInt(numPartitions);
+                                        int k = rng.nextInt(numKeysPerPartition);
+                                        InternalRow v = query.lookup(row(p), 0, row(k));
+                                        if (v == null) {
+                                            // race window where the refresher just rebuilt the
+                                            // bucket; a null result is acceptable
+                                            continue;
+                                        }
+                                        // We must always observe the row we asked for, never a
+                                        // bleed-through from another key in the same bucket.
+                                        assertThat(v.getInt(0)).isEqualTo(p);
+                                        assertThat(v.getInt(1)).isEqualTo(k);
+                                        assertThat(v.getLong(2))
+                                                .isGreaterThanOrEqualTo(p * 100L + k);
+                                        lookupsHit.incrementAndGet();
+                                    }
+                                } catch (Throwable t) {
+                                    firstError.compareAndSet(null, t);
+                                    errors.incrementAndGet();
+                                }
+                            }));
+        }
+
+        for (Future<?> f : futures) {
+            f.get(60, TimeUnit.SECONDS);
+        }
+        refresherRunning.set(false);
+        refresherFuture.get(60, TimeUnit.SECONDS);
+
+        pool.shutdown();
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+
+        if (errors.get() > 0) {
+            throw new AssertionError(
+                    "observed " + errors.get() + " worker errors, first: " + firstError.get(),
+                    firstError.get());
+        }
+        // sanity: with this much load we expect the vast majority of lookups to hit
+        assertThat(lookupsHit.get()).isGreaterThan(numReaders * lookupsPerReader / 2);
+
+        query.close();
+        write.close();
+        commit.close();
     }
 
     @ParameterizedTest
